@@ -27,4 +27,3 @@ Evolutionary Algorithm
 
 
 [![IMAGE ALT TEXT HERE](https://img.youtube.com/vi/HJbIKW_k-dY/0.jpg)](https://youtu.be/HJbIKW_k-dY)
- https://youtu.be/HJbIKW_k-dY
