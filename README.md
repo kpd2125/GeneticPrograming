@@ -24,3 +24,5 @@ Evolutionary Algorithm
     - Mutation
   - Diversity Creation
     - Deterministic crowding
+
+ https://youtu.be/HJbIKW_k-dY
