@@ -1,0 +1,1419 @@
+import open3d as o3d
+import numpy as np
+import time
+import math
+from matplotlib import pyplot as plt
+import time
+from scipy import signal
+import random
+import copy
+from itertools import combinations
+from numba import jit, typeof
+from numba import int32, float32    # import the types
+from numba import jitclass, float64, int32, float32, int64
+
+k_const = float(700)
+l_naught = 0.1
+T = 0
+dt = 0.0012
+g = -9.81
+kc = 10000
+
+class Mass(object):
+    def __init__(self, mass, position, velocity, acceleration, internal_f, external_f):
+        self.mass = mass
+        self.position = position
+        self.velocity = velocity
+        self.acceleration = acceleration
+        self.internal_f = internal_f
+        self.external_f = external_f
+class Spring(object):
+    def __init__(self, k, l_naught, a, speed_var, Mindex1, Mindex2):
+        self.k = k
+        self.l_naught = l_naught
+        #self.mass_indices = [m1,m2]
+        self.a = a
+        self.speed_var = speed_var
+        self.Mindex1 = Mindex1
+        self.Mindex2 = Mindex2
+def setView(ctr, camera_pos = (1,1,1), lookat = (0,0,0), up = (0,0,1)):
+    ctr.set_constant_z_far(100) #camera far z clip plane
+    ctr.set_constant_z_near(0.01) #camera near z clip plane   
+def customVisualization(geometry_list):
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    for g in geometry_list:
+        vis.add_geometry(g)
+    ctr = vis.get_view_control()
+    setView(ctr)
+    vis.run()
+    vis.destroy_window()
+def createPlane(r=4, dr=0.1):
+    bounds = np.array([[-r, -r, 0],[r, r, 0]])/dr
+    bounds = np.stack((np.floor(bounds[0]), np.ceil(bounds[1])))*dr
+    nx, ny, nz = np.ceil((bounds[1]-bounds[0])/dr).astype(int)
+    xyz = np.reshape([[[[i, j, 0], [i+1, j, 0], [i, j+1, 0], [i, j+1, 0], [i+1, j, 0], [i+1, j+1, 0]] for i in range(nx-1)]for j in range(ny-1)], (-1, 3))
+    xyz = (xyz - ((nx-1)/2,(ny-1)/2,0))*dr
+    triangles = np.arange(xyz.shape[0]).reshape((-1,3))
+    plane = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(xyz), o3d.utility.Vector3iVector(triangles))
+    # assign checkerboard color pattern\n",
+    c0 = (0.729, 0.78, 0.655) # first color\n",
+    c1 = (0.533, 0.62, 0.506) # second color\n",
+    colors = np.reshape([[np.tile(c0 if (i+j)%2 else c1,(6,1)) for i in range(nx-1)] for j in range(ny-1)],(-1,3))
+    plane.vertex_colors = o3d.utility.Vector3dVector(colors)
+    plane.compute_triangle_normals()
+    return plane
+def addSingleMass(masses, xyz):
+    rand = random.randint(0, len(xyz)-1)
+    new_point = np.copy(xyz[rand])
+    truth = 0
+    compare_array = np.zeros((len(xyz)))
+    while truth == 0:
+        x_y_or_z = random.randint(0, 3)
+        if x_y_or_z == 0:
+            new_point[0] += 0.1
+        if x_y_or_z == 1:
+            new_point[1] += 0.1
+        if x_y_or_z == 2:
+            new_point[2] += 0.1
+        for i in range(len(xyz)):
+            compare_array[i] = int(np.allclose(new_point, xyz[i]))
+            if np.sum(compare_array) == 0:
+                truth = 1
+            else:
+                truth = 0
+    point_mass = Mass(0.5, np.array([new_point[0],new_point[1],new_point[2]]), np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]))
+    masses.append(point_mass)
+    xyz = np.append(xyz, [new_point], axis = 0)
+    return masses, xyz
+def randShape1(num_mass_len, num_mass_width, num_mass_height, x, y, z, num_of_masses):
+    masses = [' ']*(num_of_masses)
+    coords = np.zeros((27, 3))
+    y = 0
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                coords[y][0] = k/10
+                coords[y][1] = j/10
+                coords[y][2] = i/10
+                y += 1
+    random_indexs = random.sample(range(len(coords)), num_of_masses)
+    xyz = np.zeros((num_of_masses, 3))
+    for i in range(len(random_indexs)):
+        xyz[i][0] = coords[random_indexs[i]][0]
+        xyz[i][1] = coords[random_indexs[i]][1]
+        xyz[i][2] = coords[random_indexs[i]][2]
+    index = 0
+    for i in range(len(xyz)):
+        point_mass = Mass(0.5, np.array([xyz[i][0],xyz[i][1],xyz[i][2]]), np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]), np.array([0.0,0.0,0.0]))
+        masses[index] = point_mass
+        index+=1
+    mass_list = copy.deepcopy(masses)
+    xyz_list = copy.deepcopy(xyz) 
+    return masses, xyz
+def shape():
+    radius_grid = 0.1
+    radius_knn = radius_grid*np.sqrt(3)*1.01
+    max_nn = 28
+    rand_num = random.randint(0, 25) #was 10
+    masses, xyz = randShape1(1,1,1,0,0,0,18) #was 18
+    for i in range(rand_num):
+        masses, xyz = addSingleMass(masses, xyz)
+    mass_list = masses 
+    x_max = np.max(xyz[:,0])
+    y_max = np.max(xyz[:,1])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+    neighbors = [np.asarray(pcd_tree.search_hybrid_vector_3d(point, radius_knn,max_nn = max_nn)[1]) for point in xyz]
+    springs = connect_masses(k_const, mass_list, neighbors, x_max, y_max)
+    edges = np.vstack([GetEdges(neighbor[:max_nn]) for neighbor in neighbors])
+    return springs, xyz, edges, mass_list
+def addToshape(masses, xyz):
+    radius_grid = 0.1
+    radius_knn = radius_grid*np.sqrt(3)*1.01
+    max_nn = 28
+    masses, xyz = addSingleMass(masses, xyz)
+    mass_list = masses 
+    x_max = np.max(xyz[:,0])
+    y_max = np.max(xyz[:,1])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+    neighbors = [np.asarray(pcd_tree.search_hybrid_vector_3d(point, radius_knn,max_nn = max_nn)[1]) for point in xyz]
+    springs = connect_masses(k_const, mass_list, neighbors, x_max, y_max)
+    edges = np.vstack([GetEdges(neighbor[:max_nn]) for neighbor in neighbors])
+    return springs, xyz, edges, mass_list
+def delSingleMass(masses, xyz):
+    rand = random.randint(0, len(xyz)-1)
+    distance_array = np.zeros((len(xyz)))
+    count = 0
+    limit = 0
+    while count < 5:
+        count = 0
+        for i in range(len(distance_array)):
+            dist = math.sqrt(pow((xyz[rand][0] - xyz[i][0]),2) + pow((xyz[rand][1] - xyz[i][1]),2) + pow((xyz[rand][2] - xyz[i][2]),2))
+            distance_array[i] = dist
+            if dist < 0.1*math.sqrt(2):
+                count += 1
+            if count >= 9:
+                break
+        rand = random.randint(0, len(xyz)-1)
+        limit += 1
+        if limit == 10:
+            break
+    if limit < 10:
+       masses.pop(rand)
+       xyz = np.delete(xyz, rand, 0)
+       return masses, xyz
+    if limit == 10:
+       masses, xyz = addSingleMass(masses, xyz)
+       return masses, xyz
+def removeFromshape(masses, xyz):
+    radius_grid = 0.1
+    radius_knn = radius_grid*np.sqrt(3)*1.01
+    max_nn = 28
+    masses, xyz = delSingleMass(masses, xyz)
+    mass_list = masses 
+    x_max = np.max(xyz[:,0])
+    y_max = np.max(xyz[:,1])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+    neighbors = [np.asarray(pcd_tree.search_hybrid_vector_3d(point, radius_knn,max_nn = max_nn)[1]) for point in xyz]
+    springs = connect_masses(k_const, mass_list, neighbors, x_max, y_max)
+    edges = np.vstack([GetEdges(neighbor[:max_nn]) for neighbor in neighbors])
+    return springs, xyz, edges, mass_list
+def delFromshape(masses, xyz):
+    radius_grid = 0.1
+    radius_knn = radius_grid*np.sqrt(3)*1.01
+    max_nn = 28
+    masses, xyz = addSingleMass(masses, xyz)
+    mass_list = masses 
+    x_max = np.max(xyz[:,0])
+    y_max = np.max(xyz[:,1])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+    neighbors = [np.asarray(pcd_tree.search_hybrid_vector_3d(point, radius_knn,max_nn = max_nn)[1]) for point in xyz]
+    springs = connect_masses(k_const, mass_list, neighbors, x_max, y_max)
+    edges = np.vstack([GetEdges(neighbor[:max_nn]) for neighbor in neighbors])
+    return springs, xyz, edges, mass_list
+def shape_population(pop_size):
+    spring_array = []
+    xyz_array = []
+    edges_array = []
+    mass_list_array = []
+    for i in range(pop_size):
+        springs, xyz, edges, mass_list = shape()
+        mass_copy = copy.deepcopy(mass_list)
+        spring_array.append(springs)
+        xyz_array.append(xyz)
+        edges_array.append(edges)
+        mass_list_array.append(mass_list)
+    return spring_array, xyz_array, edges_array, mass_list_array
+def GetEdges(neighbor):
+    candidate = neighbor[1:]
+    self = neighbor[0]
+    candidate = candidate[candidate<self] # to remove redundency
+    edges = np.empty((candidate.size,2),dtype=np.int32)
+    edges[:,0]=self
+    edges[:,1]=candidate
+    return edges
+def connect_masses(k, masses, neighbors, x_max, y_max):
+    max_nn = 28
+    edges = np.vstack([GetEdges(neighbor[:max_nn]) for neighbor in neighbors])
+    springs = [' ']*len(edges)
+    p1 = np.array([0,0])
+    p2 = np.array([x_max,y_max])
+    p3 = np.array([x_max,0])
+    p4 = np.array([0,y_max])
+    hyp = (x_max/(2*math.cos(math.atan(y_max/x_max))))+0.00001
+    for i in range(len(edges)):
+        m1 = edges[i][0]
+        m2 = edges[i][1]
+        spring_var = 1234
+        l = math.sqrt(pow((masses[m2].position[0] - masses[m1].position[0]),2) + pow((masses[m2].position[1] - masses[m1].position[1]),2) + pow((masses[m2].position[2] - masses[m1].position[2]),2))
+        if dist(p1, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p1, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 1
+        elif dist(p2, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p2, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 2
+        elif dist(p3, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p3, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 3
+        elif dist(p4, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p4, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 4
+        elif dist(p1, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p2, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 12
+        elif dist(p1, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp and dist(p2, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp:
+            spring_var = 12
+        elif dist(p1, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p3, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 13
+        elif dist(p1, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp and dist(p3, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp:
+            spring_var = 13
+        elif dist(p1, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p4, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 14
+        elif dist(p1, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp and dist(p4, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp:
+            spring_var = 14
+        elif dist(p2, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p3, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 23
+        elif dist(p2, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp and dist(p3, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp:
+            spring_var = 23
+        elif dist(p2, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p4, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 24
+        elif dist(p2, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp and dist(p4, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp:
+            spring_var = 24
+        elif dist(p3, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp and dist(p4, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp:
+            spring_var = 34
+        elif dist(p3, np.array([masses[m2].position[0], masses[m2].position[1]])) < hyp and dist(p4, np.array([masses[m1].position[0], masses[m1].position[1]])) < hyp:
+            spring_var = 34
+        spring = Spring(k, l, l, spring_var, m1, m2)
+        springs[i] = spring
+    return springs
+def dist(point1, point2):
+    sum_sq = np.sum(np.square(point1 - point2))
+    return np.sqrt(sum_sq)
+def spring_force(mass1, mass2, spring):
+    diff = np.subtract(mass2.position, mass1.position)
+    vector_length = math.sqrt(pow((mass2.position[0] - mass1.position[0]),2) + pow((mass2.position[1] - mass1.position[1]),2) + pow((mass2.position[2] - mass1.position[2]),2))
+    e = np.divide(diff, vector_length)
+    e_T = e.reshape(-1, 1)
+    vel1 = mass1.velocity
+    vel2 = mass2.velocity
+    rel_vel = np.multiply(e_T, np.subtract(vel2, vel1))
+    trans = e.reshape(-1, 1)
+    kd = 45
+    vel_diff = np.subtract(mass2.velocity, mass1.velocity)
+    force1 = np.multiply(((k_const*(vector_length-spring.l_naught))+(kd*np.multiply(vel_diff, e))), e)
+    f_spring_partial = (-k_const*(vector_length - spring.l_naught))
+    force2 = np.multiply(-1, force1)
+    mass1.internal_f = np.sum([mass1.internal_f, force1], axis = 0)
+    mass2.internal_f = np.sum([mass2.internal_f, force2], axis = 0)
+    spring_pot = 0.5*k_const*(pow((vector_length-spring.l_naught),2))
+    return spring_pot
+def simulate(masses, springs, lat_force_right, lat_force_left, ground, spin):
+    xyz = np.zeros((len(masses), 3))
+    sum_of_forces = np.zeros((len(masses), 3))
+    potential_f = 0
+    potential_s = 0
+    kinetic = 0
+    g_force = 0
+    kinetic_mass = 0
+    f_fric = 0
+    for i in range(len(springs)):
+        spring_pot = spring_force(masses[springs[i].Mindex1], masses[springs[i].Mindex2], springs[i])
+        potential_s = potential_s + spring_pot
+    for i in range(len(masses)):
+        masses[i].external_f = np.array([0.0,0.0,(g*masses[i].mass)])
+        if lat_force_right == True:
+            sum_of_forces[1] = np.add(sum_of_forces[1], np.array([masses[1].mass*1000,0,masses[1].mass*1000]))
+            sum_of_forces[3] = np.add(sum_of_forces[3], np.array([masses[1].mass*1000,0,masses[3].mass*1000]))
+        if lat_force_left == True:
+            sum_of_forces[0] = np.add(sum_of_forces[0], np.array([masses[0].mass*(-400),0,0]))
+            sum_of_forces[1] = np.add(sum_of_forces[1], np.array([masses[1].mass*(-400),0,0]))
+            sum_of_forces[2] = np.add(sum_of_forces[2], np.array([masses[2].mass*(-400),0,0]))
+            sum_of_forces[3] = np.add(sum_of_forces[3], np.array([masses[3].mass*(-400),0,0]))
+            sum_of_forces[4] = np.add(sum_of_forces[4], np.array([masses[4].mass*(-400),0,0]))
+            sum_of_forces[5] = np.add(sum_of_forces[5], np.array([masses[5].mass*(-400),0,0]))
+            sum_of_forces[6] = np.add(sum_of_forces[6], np.array([masses[6].mass*(-400),0,0]))
+            sum_of_forces[7] = np.add(sum_of_forces[7], np.array([masses[7].mass*(-400),0,0]))
+        if spin == True:
+            sum_of_forces[6] = np.add(sum_of_forces[6], np.array([masses[6].mass*(-1000),masses[1].mass*(-1000),0]))
+        sum_of_forces[i] = np.add(sum_of_forces[i], masses[i].external_f)
+        sum_of_forces[i] = np.add(sum_of_forces[i], masses[i].internal_f)
+        masses[i].internal_f = np.array([0.0,0.0,0.0])
+        if masses[i].position[2] <= 0:
+            sum_of_forces[i] = np.add(sum_of_forces[i], np.array([0.0,0.0,(-g*masses[i].mass)]))
+            sum_of_forces[i] = np.add(sum_of_forces[i], np.array([0.0,0.0,(-kc*masses[i].position[2])]))
+            g_force = g_force + (0.5*kc*pow((0-masses[i].position[2]),2))
+        potential_f = potential_f + (masses[i].mass*(9.81)*abs(masses[i].position[2]))
+        kinetic_mass = kinetic_mass + (0.5 * masses[i].mass * pow(math.sqrt(pow((masses[i].velocity[0]),2) + pow((masses[i].velocity[1]),2) + pow((masses[i].velocity[2]),2)),2))
+    for i in range(len(masses)):
+        masses[i].acceleration = sum_of_forces[i]/masses[i].mass
+        masses[i].velocity = (np.add(masses[i].velocity, masses[i].acceleration*dt))*0.999
+        masses[i].position = np.add(masses[i].position, masses[i].velocity*dt)
+        xyz[i] = masses[i].position
+        if masses[i].position[2] <= 0:
+            mu = 1.0
+            if abs(masses[i].acceleration[0]) < abs(masses[i].acceleration[2])*mu or abs(masses[i].acceleration[1]) < abs(masses[i].acceleration[2])*mu:
+                masses[i].acceleration[0] = 0.0
+                masses[i].acceleration[1] = 0.0
+                masses[i].velocity[0] = 0.0
+                masses[i].velocity[1] = 0.0
+            if abs(masses[i].acceleration[0]) > abs(masses[i].acceleration[2])*mu:
+                if masses[i].acceleration[0] < 0:
+                    masses[i].acceleration[0] = masses[i].acceleration[0] + mu*abs(masses[i].acceleration[2])
+                if masses[i].acceleration[0] > 0:
+                    masses[i].acceleration[0] = masses[i].acceleration[0] - mu*abs(masses[i].acceleration[2])
+            if abs(masses[i].acceleration[1]) > abs(masses[i].acceleration[2])*mu:
+                #print(masses[i].acceleration[0])
+                if masses[i].acceleration[1] < 0:
+                    masses[i].acceleration[1] = masses[i].acceleration[1] + mu*abs(masses[i].acceleration[2])
+                if masses[i].acceleration[1] > 0:
+                    masses[i].acceleration[1] = masses[i].acceleration[1] - mu*abs(masses[i].acceleration[2])
+        if ground == True:
+            masses[7]. acceleration = np.array([0.0,0.0,0.0])
+            masses[7]. velocity = np.array([0.0,0.0,0.0])
+            masses[7]. position = np.array([0.0,0.0,0.2])
+    energy = potential_f + kinetic + potential_s + g_force + kinetic_mass
+    return xyz, sum_of_forces, energy, potential_f, kinetic_mass, potential_s, g_force
+def create_variables(pop_size):
+    variables = np.zeros((pop_size*4, 4))
+    for i in range(len(variables)):
+        variables[i][0] = random.randint(0,100)/10000
+        variables[i][1] = random.randint(0,10)
+        degree = random.randint(0,720)
+        radians = degree * (math.pi/180)
+        variables[i][2] = radians
+        variables[i][3] = random.randint(200,1500)
+    return variables
+@jit
+def oscilate(springs, t, variables):
+    for i in range(len(springs)):
+        a = springs[i].a
+        b1 = variables[0][0]
+        w1 = variables[0][1]
+        c1 = variables[0][2]
+        k1 = variables[0][3]
+        b2 = variables[1][0]
+        w2 = variables[1][1]
+        c2 = variables[1][2]
+        k2 = variables[1][3]
+        b3 = variables[2][0]
+        w3 = variables[2][1]
+        c3 = variables[2][2]
+        k3 = variables[2][3]
+        b4 = variables[3][0]
+        w4 = variables[3][1]
+        c4 = variables[3][2]
+        k4 = variables[3][3]
+        if b1 > 0.1 or b1 < 0:
+            b1 = random.randint(0,100)/1000
+        if b2 > 0.1 or b2 < 0:
+            b2 = random.randint(0,100)/1000
+        if b3 > 0.1 or b3 < 0:
+            b3 = random.randint(0,100)/1000
+        if b4 > 0.1 or b4 < 0:
+            b4 = random.randint(0,100)/1000
+        if springs[i].speed_var == 1:
+            b = b1
+            w = w1
+            c = c1
+            k = k1
+        if springs[i].speed_var == 2:
+            b = b2
+            w = w2
+            c = c2
+            k = k2
+        if springs[i].speed_var == 3:
+            b = b3
+            w = w3
+            c = c3
+            k = k3
+        if springs[i].speed_var == 4:
+            b = b4
+            w = w4
+            c = c4
+            k = k4
+        if springs[i].speed_var == 12:
+            b = (b1 + b2)/2
+            w = (w1 + w2)/2
+            c = (c1 + c2)/2
+            k = (k1 + k2)/2
+        if springs[i].speed_var == 13:
+            b = (b1 + b3)/2
+            w = (w1 + w3)/2
+            c = (c1 + c3)/2
+            k = (k1 + k3)/2
+        if springs[i].speed_var == 14:
+            b = (b1 + b4)/2
+            w = (w1 + w4)/2
+            c = (c1 + c4)/2
+            k = (k1 + k4)/2
+        if springs[i].speed_var == 23:
+            b = (b2 + b3)/2
+            w = (w2 + w3)/2
+            c = (c2 + c3)/2
+            k = (k2 + k3)/2
+        if springs[i].speed_var == 24:
+            b = (b2 + b4)/2
+            w = (w2 + w4)/2
+            c = (c2 + c4)/2
+            k = (k2 + k4)/2
+        if springs[i].speed_var == 34:
+            b = (b3 + b4)/2
+            w = (w3 + w4)/2
+            c = (c3 + c4)/2
+            k = (k3 + k4)/2
+        if springs[i].speed_var == 1234:
+            b = (b1 + b2 + b3 + b4)/4
+            w = (w1 + w2 + w3 + w4)/4
+            c = (c1 + c2 + c3 + c4)/4
+            k = (k1 + k2 + k3 + k4)/4
+        springs[i].l_naught = a + b*math.sin((w*t)+c)
+        springs[i].k = k
+@jit
+def center_of_mass(masses):
+    particle_sum = np.array([0,0,0])
+    total_mass = 0
+    for i in range(len(masses)):
+        particle_sum = np.add(particle_sum, np.multiply(masses[i].mass, masses[i].position))
+        total_mass += masses[i].mass
+    center = np.divide(particle_sum, total_mass)
+    return center
+def Velocity(start, stop, time):
+    vector_length = math.sqrt(pow((stop[0] - start[0]),2) + pow((stop[1] - start[1]),2))
+    return vector_length/time
+def bouncing_cube(masses,lsd, xyz, plane, springs, variables):
+    ended=False
+    def signalEnd(vis):
+        nonlocal ended
+        ended = True
+    lat_force_right = False
+    lat_force_left = False
+    cos_spring = False
+    sin_spring = False
+    normal = False
+    ground = False
+    spin = False
+    def force_right(vis):
+        nonlocal lat_force_right
+        lat_force_right = True
+    def force_left(vis):
+        nonlocal lat_force_left
+        lat_force_left = True  
+    def start_high(vis):
+        for i in range(len(masses)):
+            masses[i].position = np.add(masses[i].position, np.array([0,0,.3]))
+    def cos_length(vis):
+        nonlocal cos_spring
+        cos_spring = True
+    def sin_length(vis):
+        nonlocal sin_spring
+        sin_spring = True
+    def normal_l(vis):
+        nonlocal normal
+        normal = True
+    def grounded_func(vis):
+        nonlocal ground
+        ground = True
+    def grounded_let_go(vis):
+        nonlocal ground
+        ground = False
+    def grounded_spin(vis):
+        nonlocal spin
+        spin = True
+#    vis = o3d.visualization.VisualizerWithKeyCallback()
+#    vis.register_key_callback(81, force_right)# key Q
+#    vis.register_key_callback(82, force_left)# key R
+#    vis.register_key_callback(256, signalEnd)# key escape
+#    vis.register_key_callback(32, start_high)# space
+#    vis.register_key_callback(67, cos_length)# key C
+#    vis.register_key_callback(83, sin_length)# key S
+#    vis.register_key_callback(78, normal_l)# key N
+#    vis.register_key_callback(71, grounded_func)# key G
+#    vis.register_key_callback(72, grounded_let_go)# key H
+#    vis.register_key_callback(74, grounded_spin)# key J
+#        #vis.register_key_callback()
+#    vis.create_window()
+#    
+#    vis.add_geometry(lsd)
+#    vis.add_geometry(plane)
+#    
+#    ctr = vis.get_view_control()
+#    setView(ctr)
+    mass_pos_t = np.copy(xyz)
+    t_prev = time.time() # previous time
+    array = []
+    spring_potential = []
+    ground_spring = []
+    kinetic_masses = []
+    grav_pot = []
+    spring_evals = 1
+    center = center_of_mass(masses)
+    starting_COM = center
+    start_time = time.perf_counter()
+    i = 0
+    while i < 8:
+    #while (not ended):  
+        t = time.time()
+        oscilate(springs,t, variables)
+        spring_evals += 1
+        if ground == True:
+            masses[7].position = np.array([0,0,0.2])
+        mass_pos_t, forces, energy, potential_f, kinetic_mass, potential_s, g_force = simulate(masses, springs, lat_force_right, lat_force_left, ground, spin)
+        temp = np.sum(forces)
+        if cos_spring == True:
+            springs[0].l_naught = 0.1+0.1*math.cos(t+0.01)
+            springs[1].l_naught = 0.1+0.1*math.cos(t+0.01)
+        if sin_spring == True:
+            print('sin')
+            springs[0].l_naught = 0.1+0.2*math.sin(t+0.01)
+            springs[1].l_naught = 0.1+0.2*math.sin(t+0.01)
+            springs[10].l_naught = 0.1+0.2*math.sin(t+0.01)
+            springs[11].l_naught = 0.1+0.2*math.sin(t+0.01)
+        if normal == True:
+            print('normal')
+            springs[0].l_naught = 0.1
+            springs[1].l_naught = 0.1
+            springs[10].l_naught = 0.1
+            springs[11].l_naught = 0.1
+        array.append(energy)
+        spring_potential.append(potential_s)
+        ground_spring.append(g_force)
+        kinetic_masses.append(kinetic_mass)
+        grav_pot.append(potential_f)
+        center = center_of_mass(masses)
+        lat_force_right = False
+        lat_force_left = False
+        spin = False
+#        if t - t_prev>1./60.:
+#            t_prev = t
+#            lsd.points = o3d.utility.Vector3dVector(mass_pos_t)
+#            vis.update_geometry(lsd)
+#            vis.poll_events()
+#            vis.update_renderer()
+        i += 1
+    end_time = time.perf_counter()
+    time_length = end_time - start_time
+    speed = Velocity(starting_COM, center, time_length)
+    evals_per_sec = (spring_evals * len(springs))/time_length
+#    vis.destroy_window()
+    return speed
+def evolve(variables):
+    mutate_num_var = random.randint(0, len(variables[0]))
+    indices = random.sample(range(len(variables[0])), mutate_num_var)
+    for i in range(len(variables)):
+        for j in range(len(indices)):
+            if indices[j] == 0:
+                plus_minus = random.randint(0, 1)
+                if plus_minus == 0:
+                    variable_num = variables[i][indices[j]]
+                    rand_dec = random.randint(0,100)/5000
+                    if variable_num + rand_dec >= 0.1:
+                        variables[i][indices[j]] = variables[i][indices[j]] - rand_dec
+                    if variable_num + rand_dec < 0.1:
+                        variables[i][indices[j]] = variables[i][indices[j]] + rand_dec
+                if plus_minus == 1:
+                    variable_num = variables[i][indices[j]]
+                    rand_dec = random.randint(0,100)/5000
+                    if variable_num - rand_dec < 0:
+                        variables[i][indices[j]] = variables[i][indices[j]] + rand_dec
+                    if variable_num - rand_dec > 0:
+                        variables[i][indices[j]] = variables[i][indices[j]] - rand_dec
+            if indices[j] == 1:
+                plus_minus = random.randint(0, 1)
+                if plus_minus == 0:
+                    variables[i][indices[j]] = variables[i][indices[j]] + random.random()
+                if plus_minus == 1:
+                    variables[i][indices[j]] = variables[i][indices[j]] - random.random()
+            if indices[j] == 2:
+                plus_minus = random.randint(0, 1)
+                if plus_minus == 0:
+                    variables[i][indices[j]] = variables[i][indices[j]] + random.randint(0,20)*(math.pi/180)
+                if plus_minus == 1:
+                    variables[i][indices[j]] = variables[i][indices[j]] - random.randint(0,20)*(math.pi/180)
+            if indices[j] == 3:
+                plus_minus = random.randint(0, 1)
+                if plus_minus == 0:
+                    variable_num = variables[i][indices[j]]
+                    rand_dec = random.randint(0,50)
+                    if variable_num + rand_dec >= 1500:
+                        plus_minus == 1
+                    if variable_num + rand_dec < 1500:
+                        variables[i][indices[j]] = variables[i][indices[j]] + rand_dec
+                if plus_minus == 1:
+                    variable_num = variables[i][indices[j]]
+                    rand_dec = random.randint(0,50)
+                    if variable_num - rand_dec <= 500:
+                        variables[i][indices[j]] = variables[i][indices[j]] + rand_dec
+                    if variable_num - rand_dec > 500:
+                        variables[i][indices[j]] = variables[i][indices[j]] - rand_dec
+def crossover(variables):
+    point1 = random.randint(0, len(variables[0]))
+    point2 = random.randint(0, len(variables[0]))
+    possible = [0,1,2,3]
+    first_pair = random.sample(range(len(variables[0])), 2)
+    second_pair = [' ']*2
+    index = 0
+    for i in range(len(possible)):
+        if possible[i] not in first_pair:
+            second_pair[index] = possible[i]
+            index+=1
+    pair1_1l = np.zeros((point1))
+    pair1_2l = np.zeros((point1))
+    pair1_1r = np.zeros((4-point1))
+    pair1_2r = np.zeros((4-point1))
+    pair2_1l = np.zeros((point2))
+    pair2_2l = np.zeros((point2))
+    pair2_1r = np.zeros((4-point2))
+    pair2_2r = np.zeros((4-point2))
+    for i in range(len(pair1_1l)):
+        pair1_1l[i] = variables[first_pair[0]][i]
+        pair1_2l[i] = variables[first_pair[1]][i]
+    index1 = point1
+    for i in range(len(pair1_1r)):
+        pair1_1r[i] = variables[first_pair[0]][index1]
+        pair1_2r[i] = variables[first_pair[1]][index1]
+        index1 += 1
+    for i in range(len(pair2_1l)):
+        pair2_1l[i] = variables[second_pair[0]][i]
+        pair2_2l[i] = variables[second_pair[1]][i]
+    index2 = point2
+    for i in range(len(pair2_1r)):
+        pair2_1r[i] = variables[second_pair[0]][index2]
+        pair2_2r[i] = variables[second_pair[1]][index2]
+        index2 += 1
+    var1 = np.concatenate((pair1_1l,pair1_2r))
+    var2 = np.concatenate((pair1_2l,pair1_1r))
+    var3 = np.concatenate((pair2_1l,pair2_2r))
+    var4 = np.concatenate((pair2_2l,pair2_1r))
+    mix = random.randint(0, 1)
+    if mix == 0:
+        var1 = np.concatenate((pair1_1l,pair1_2r))
+        var2 = np.concatenate((pair1_2l,pair1_1r))
+        var3 = np.concatenate((pair2_1l,pair2_2r))
+        var4 = np.concatenate((pair2_2l,pair2_1r))
+        for i in range(len(var1)):
+            variables[first_pair[0]][i] = var1[i]
+            variables[first_pair[1]][i] = var2[i]
+            variables[second_pair[0]][i] = var3[i]
+            variables[second_pair[1]][i] = var4[i]
+    if mix == 1:
+        var1 = np.concatenate((pair1_2l,pair1_1r))
+        var2 = np.concatenate((pair1_1l,pair1_2r))
+        var3 = np.concatenate((pair2_2l,pair2_1r))
+        var4 = np.concatenate((pair2_1l,pair2_2r))
+        for i in range(len(var1)):
+            variables[first_pair[0]][i] = var1[i]
+            variables[first_pair[1]][i] = var2[i]
+            variables[second_pair[0]][i] = var3[i]
+            variables[second_pair[1]][i] = var4[i]
+def randomWalk(num_of_evals, plane):
+    best_speed = 0
+    speeds = np.zeros((num_of_evals))
+    variables = create_variables(num_of_evals)
+    for i in range(num_of_evals):
+        springs, xyz, edges, masses = shape()
+        lsd = o3d.geometry.LineSet()
+        lsd.points = o3d.utility.Vector3dVector(xyz) # (n by 3) arry of points xyzs
+        lsd.lines = o3d.utility.Vector2iVector(edges) # (n by 2) indices of the edges
+        speed = bouncing_cube(masses, lsd, xyz, plane, springs, variables[(i*4):(i*4)+4])
+        if speed > best_speed:
+            best_speed = speed
+            best_speed_vars = np.copy(variables[(i*4):(i*4)+4])
+        speeds[i] = best_speed
+    return speeds, best_speed_vars, best_speed
+def hill_climb(num_of_evals, plane):
+    best_speed = 0
+    speeds = np.zeros((num_of_evals))
+    variables = create_variables(num_of_evals)
+    for i in range(num_of_evals):
+        original_vars = np.copy(variables[(i*4):(i*4)+4])
+        springs, xyz, edges, masses = shape()
+        lsd = o3d.geometry.LineSet()
+        lsd.points = o3d.utility.Vector3dVector(xyz) # (n by 3) arry of points xyzs
+        lsd.lines = o3d.utility.Vector2iVector(edges) # (n by 2) indices of the edges
+        speed = bouncing_cube(masses, lsd, xyz, plane, springs, variables[(i*4):(i*4)+4])
+        springs1, xyz1, edges1, masses1 = shape()
+        lsd1 = o3d.geometry.LineSet()
+        lsd1.points = o3d.utility.Vector3dVector(xyz) # (n by 3) arry of points xyzs
+        lsd1.lines = o3d.utility.Vector2iVector(edges) # (n by 2) indices of the edges
+        evolve(variables[(i*4):(i*4)+4])
+        speed1 = bouncing_cube(masses1, lsd1, xyz1, plane, springs1, variables[(i*4):(i*4)+4])
+        if speed > speed1:
+            variables[(i*4):(i*4)+4] = original_vars
+            if speed > best_speed:
+                best_speed = speed
+                best_speed_vars = np.copy(variables[(i*4):(i*4)+4])
+        else:
+            if speed1 > best_speed:
+                best_speed = speed1
+                best_speed_vars = np.copy(variables[(i*4):(i*4)+4])
+        speeds[i] = best_speed
+    return speeds, best_speed_vars, best_speed
+@jit
+def GP_nomass(num_of_evals, plane, more_mut):
+    pop_size = 2
+    fastest_index = np.array([0.0,0.0])
+    speeds = np.zeros((num_of_evals))
+    variables = create_variables(pop_size)
+    best_speed = 0
+    best_speed_vars = np.zeros((4,4))
+    best_speed_xyz = [' ']
+    dot_plot_data = np.zeros((num_of_evals,pop_size))
+    all_sizes = np.zeros((num_of_evals,pop_size))
+    spring_array, xyz_array, edges_array, mass_list_array = shape_population(pop_size)
+    final_speeds = np.zeros((len(xyz_array)))
+    for j in range(num_of_evals):
+        for i in range(int(pop_size/2)):
+            lsd = o3d.geometry.LineSet()
+            lsd.points = o3d.utility.Vector3dVector(xyz_array[2*i]) # (n by 3) arry of points xyzs
+            lsd.lines = o3d.utility.Vector2iVector(edges_array[2*i]) # (n by 2) indices of the edges
+            lsd1 = o3d.geometry.LineSet()
+            lsd1.points = o3d.utility.Vector3dVector(xyz_array[(2*i)+1]) # (n by 3) arry of points xyzs
+            lsd1.lines = o3d.utility.Vector2iVector(edges_array[(2*i)+1]) # (n by 2) indices of the edges
+            speed1 = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], variables[(i*8):(i*8)+4])
+            speed2 = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], variables[(i*8)+4:(i*8)+8])
+            if j == (num_of_evals - 1):
+                final_speeds[i*2] = speed1
+                final_speeds[(i*2)+1] = speed2
+            dot_plot_data[j][i*2] = speed1 
+            dot_plot_data[j][(i*2)+1] = speed2
+            all_sizes[j][i*2] = len(xyz_array[2*i])
+            all_sizes[j][(i*2)+1] = len(xyz_array[(2*i)+1])
+            cross_or_mut = random.randint(0, 1)
+            if speed1 < speed2:
+                if speed2 > best_speed:
+                    best_speed = speed2
+                    best_speed_vars = np.copy(variables[(i*8)+4:(i*8)+8])
+                    best_speed_xyz.pop(0)
+                    best_speed_xyz.append(xyz_array[i*2])
+                    fastest_index = [j,i]
+                if cross_or_mut > 0:
+                    evolve(variables[(i*8):(i*8)+4])
+                if cross_or_mut == 0:
+                    temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                    variables[(i*8):(i*8)+4] = temp
+                    crossover(variables[(i*8):(i*8)+4])
+            if speed2 < speed1:
+                if speed1 > best_speed:
+                    best_speed = speed1
+                    best_speed_vars = np.copy(variables[(i*8):(i*8)+4])
+                    best_speed_xyz.pop(0)
+                    best_speed_xyz.append(xyz_array[(i*2)+1])
+                    fastest_index = [j,i]
+                if cross_or_mut > 0:
+                    evolve(variables[(i*8)+4:(i*8)+8])
+                if cross_or_mut == 0:
+                    temp = np.copy(variables[(i*8):(i*8)+4])
+                    variables[(i*8)+4:(i*8)+8] = temp
+                    crossover(variables[(i*8)+4:(i*8)+8])
+        speeds[j] = best_speed
+    complexity = np.zeros((len(xyz_array)))
+    for i in range(len(xyz_array)):
+        complexity[i] = len(xyz_array[i])    
+    return speeds, best_speed_vars, best_speed, dot_plot_data, complexity, final_speeds, best_speed_xyz, fastest_index, all_sizes
+@jit       
+def GP_noDC(num_of_evals, plane, more_mut):
+    pop_size = 2
+    fastest_index = np.array([0.0,0.0])
+    speeds = np.zeros((num_of_evals))
+    variables = create_variables(pop_size)
+    best_speed = 0
+    best_speed_vars = np.zeros((4,4))
+    best_speed_xyz = [' ']
+    dot_plot_data = np.zeros((num_of_evals,pop_size))
+    all_sizes = np.zeros((num_of_evals,pop_size))
+    spring_array, xyz_array, edges_array, mass_list_array = shape_population(pop_size)
+    final_speeds = np.zeros((len(xyz_array)))
+    for j in range(num_of_evals):
+        for i in range(int(pop_size/2)):
+            lsd = o3d.geometry.LineSet()
+            lsd.points = o3d.utility.Vector3dVector(xyz_array[2*i]) # (n by 3) arry of points xyzs
+            lsd.lines = o3d.utility.Vector2iVector(edges_array[2*i]) # (n by 2) indices of the edges
+            lsd1 = o3d.geometry.LineSet()
+            lsd1.points = o3d.utility.Vector3dVector(xyz_array[(2*i)+1]) # (n by 3) arry of points xyzs
+            lsd1.lines = o3d.utility.Vector2iVector(edges_array[(2*i)+1]) # (n by 2) indices of the edges
+            speed1 = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], variables[(i*8):(i*8)+4])
+            speed2 = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], variables[(i*8)+4:(i*8)+8])
+            if j == (num_of_evals - 1):
+                final_speeds[i*2] = speed1
+                final_speeds[(i*2)+1] = speed2
+            dot_plot_data[j][i*2] = speed1 
+            dot_plot_data[j][(i*2)+1] = speed2
+            all_sizes[j][i*2] = len(xyz_array[2*i])
+            all_sizes[j][(i*2)+1] = len(xyz_array[(2*i)+1])
+            cross_or_mut = random.randint(0, 1)
+            if speed1 < speed2:
+                if speed2 > best_speed:
+                    best_speed = speed2
+                    best_speed_vars = np.copy(variables[(i*8)+4:(i*8)+8])
+                    best_speed_xyz.pop(0)
+                    best_speed_xyz.append(xyz_array[i*2])
+                    fastest_index = [j,i]
+                if len(mass_list_array[2*i]) > 1.2*len(mass_list_array[(2*i)+1]):
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8):(i*8)+4])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                elif len(mass_list_array[2*i]) < 0.8*len(mass_list_array[(2*i)+1]):
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8):(i*8)+4])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                elif len(mass_list_array[(2*i)]) <= 1.2*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) >= len(mass_list_array[(2*i)+1]) and speed1 > 0.9*speed2:
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                elif len(mass_list_array[(2*i)]) <= 1.2*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) >= len(mass_list_array[(2*i)+1]) and speed1 <= 0.9*speed2:
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8):(i*8)+4])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                elif len(mass_list_array[(2*i)]) >= 0.8*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) < len(mass_list_array[(2*i)+1]) and speed1 > 0.9*speed2:
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                elif len(mass_list_array[(2*i)]) >= 0.8*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) < len(mass_list_array[(2*i)+1]) and speed1 <= 0.9*speed2:
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8):(i*8)+4])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+            if speed2 < speed1:
+                if speed1 > best_speed:
+                    best_speed = speed1
+                    best_speed_vars = np.copy(variables[(i*8):(i*8)+4])
+                    best_speed_xyz.pop(0)
+                    best_speed_xyz.append(xyz_array[(i*2)+1])
+                    fastest_index = [j,i]
+                if len(mass_list_array[(2*i)+1]) > 1.2*len(mass_list_array[(2*i)]):
+                    #print('subtract a mass: ', len(mass_list_array[(2*i)+1]))
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                    #print('subtracted a mass: ', len(mass_list_array[(2*i)+1]))
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                elif len(mass_list_array[(2*i)+1]) < 0.8*len(mass_list_array[(2*i)]):
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                elif len(mass_list_array[(2*i)+1]) <= 1.2*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) >= len(mass_list_array[(2*i)]) and speed2 > 0.9*speed1:
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                elif len(mass_list_array[(2*i)+1]) <= 1.2*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) >= len(mass_list_array[(2*i)]) and speed2 <= 0.9*speed1:
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                elif len(mass_list_array[(2*i)+1]) >= 0.8*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) < len(mass_list_array[(2*i)]) and speed2 > 0.9*speed1:
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                elif len(mass_list_array[(2*i)+1]) >= 0.8*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) < len(mass_list_array[(2*i)]) and speed2 <= 0.9*speed1:
+                    if cross_or_mut > 0:
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])  
+        speeds[j] = best_speed
+    complexity = np.zeros((len(xyz_array)))
+    for i in range(len(xyz_array)):
+        complexity[i] = len(xyz_array[i])    
+    return speeds, best_speed_vars, best_speed, dot_plot_data, complexity, final_speeds, best_speed_xyz, fastest_index, all_sizes
+@jit       
+def GP(num_of_evals, plane, more_mut):
+    pop_size = 100
+    fastest_index = np.array([0.0,0.0])
+    speeds = np.zeros((num_of_evals))
+    variables = create_variables(pop_size)
+    best_speed = 0
+    best_speed_vars = np.zeros((4,4))
+    best_speed_xyz = [' ']
+    dot_plot_data = np.zeros((num_of_evals,pop_size))
+    all_sizes = np.zeros((num_of_evals,pop_size))
+    spring_array, xyz_array, edges_array, mass_list_array = shape_population(pop_size)
+    final_speeds = np.zeros((len(xyz_array)))
+    for j in range(num_of_evals):
+        for i in range(int(pop_size/2)):
+            lsd = o3d.geometry.LineSet()
+            lsd.points = o3d.utility.Vector3dVector(xyz_array[2*i]) # (n by 3) arry of points xyzs
+            lsd.lines = o3d.utility.Vector2iVector(edges_array[2*i]) # (n by 2) indices of the edges
+            lsd1 = o3d.geometry.LineSet()
+            lsd1.points = o3d.utility.Vector3dVector(xyz_array[(2*i)+1]) # (n by 3) arry of points xyzs
+            lsd1.lines = o3d.utility.Vector2iVector(edges_array[(2*i)+1]) # (n by 2) indices of the edges
+            speed1 = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], variables[(i*8):(i*8)+4])
+            speed2 = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], variables[(i*8)+4:(i*8)+8])
+            if j == (num_of_evals - 1):
+                final_speeds[i*2] = speed1
+                final_speeds[(i*2)+1] = speed2
+            dot_plot_data[j][i*2] = speed1 
+            dot_plot_data[j][(i*2)+1] = speed2
+            all_sizes[j][i*2] = len(xyz_array[2*i])
+            all_sizes[j][(i*2)+1] = len(xyz_array[(2*i)+1])
+            cross_or_mut = random.randint(0, 1)
+            if speed1 < speed2:
+                if speed2 > best_speed:
+                    best_speed = speed2
+                    best_speed_vars = np.copy(variables[(i*8)+4:(i*8)+8])
+                    best_speed_xyz.pop(0)
+                    best_speed_xyz.append(xyz_array[i*2])
+                    fastest_index = [j,i]
+                if len(mass_list_array[2*i]) > 1.2*len(mass_list_array[(2*i)+1]):
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8):(i*8)+4])
+                        evolve(variables[(i*8):(i*8)+4])
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                        parent = temp
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child 
+                elif len(mass_list_array[2*i]) < 0.8*len(mass_list_array[(2*i)+1]):
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8):(i*8)+4])
+                        evolve(variables[(i*8):(i*8)+4])
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                        parent = temp
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child   
+                elif len(mass_list_array[(2*i)]) <= 1.2*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) >= len(mass_list_array[(2*i)+1]) and speed1 > 0.9*speed2:
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                elif len(mass_list_array[(2*i)]) <= 1.2*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) >= len(mass_list_array[(2*i)+1]) and speed1 <= 0.9*speed2:
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8):(i*8)+4])
+                        evolve(variables[(i*8):(i*8)+4])
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child  
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                        parent = temp
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child  
+                elif len(mass_list_array[(2*i)]) >= 0.8*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) < len(mass_list_array[(2*i)+1]) and speed1 > 0.9*speed2:
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[2*i], xyz_array[2*i])
+                    spring_array.pop(2*i)
+                    spring_array.insert(2*i, springs)
+                    xyz_array.pop(2*i)
+                    xyz_array.insert(2*i, xyz)
+                    edges_array.pop(2*i)
+                    edges_array.insert(2*i, edges)
+                    mass_list_array.pop(2*i)
+                    mass_list_array.insert(2*i, mass_list)
+                elif len(mass_list_array[(2*i)]) >= 0.8*len(mass_list_array[(2*i)+1]) and len(mass_list_array[(2*i)]) < len(mass_list_array[(2*i)+1]) and speed1 <= 0.9*speed2:
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8):(i*8)+4])
+                        evolve(variables[(i*8):(i*8)+4])
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8)+4:(i*8)+8])
+                        variables[(i*8):(i*8)+4] = temp
+                        crossover(variables[(i*8):(i*8)+4])
+                        parent = temp
+                        child = np.copy(variables[(i*8):(i*8)+4])
+                        parent_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], parent)
+                        child_speed = bouncing_cube(mass_list_array[i*2], lsd, xyz_array[2*i], plane, spring_array[i*2], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8):(i*8)+4] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8):(i*8)+4] = child 
+                if more_mut == 1:
+                    if speed2 < 0.33*best_speed:
+                        evolve(variables[(i*8)+4:(i*8)+8])
+            if speed2 < speed1:
+                if speed1 > best_speed:
+                    best_speed = speed1
+                    best_speed_vars = np.copy(variables[(i*8):(i*8)+4])
+                    best_speed_xyz.pop(0)
+                    best_speed_xyz.append(xyz_array[(i*2)+1])
+                    fastest_index = [j,i]
+                if len(mass_list_array[(2*i)+1]) > 1.2*len(mass_list_array[(2*i)]):
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8)+4:(i*8)+8])
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                        parent = temp
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                elif len(mass_list_array[(2*i)+1]) < 0.8*len(mass_list_array[(2*i)]):
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8)+4:(i*8)+8])
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                        parent = temp
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                elif len(mass_list_array[(2*i)+1]) <= 1.2*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) >= len(mass_list_array[(2*i)]) and speed2 > 0.9*speed1:
+                    springs, xyz, edges, mass_list = removeFromshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                elif len(mass_list_array[(2*i)+1]) <= 1.2*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) >= len(mass_list_array[(2*i)]) and speed2 <= 0.9*speed1:
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8)+4:(i*8)+8])
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                        parent = temp
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                elif len(mass_list_array[(2*i)+1]) >= 0.8*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) < len(mass_list_array[(2*i)]) and speed2 > 0.9*speed1:
+                    springs, xyz, edges, mass_list = addToshape(mass_list_array[(2*i)+1], xyz_array[(2*i)+1])
+                    spring_array.pop((2*i)+1)
+                    spring_array.insert((2*i)+1, springs)
+                    xyz_array.pop((2*i)+1)
+                    xyz_array.insert((2*i)+1, xyz)
+                    edges_array.pop((2*i)+1)
+                    edges_array.insert((2*i)+1, edges)
+                    mass_list_array.pop((2*i)+1)
+                    mass_list_array.insert((2*i)+1, mass_list)
+                elif len(mass_list_array[(2*i)+1]) >= 0.8*len(mass_list_array[(2*i)]) and len(mass_list_array[(2*i)+1]) < len(mass_list_array[(2*i)]) and speed2 <= 0.9*speed1:
+                    if cross_or_mut > 0:
+                        parent = np.copy(variables[(i*8)+4:(i*8)+8])
+                        evolve(variables[(i*8)+4:(i*8)+8])
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                    if cross_or_mut == 0:
+                        temp = np.copy(variables[(i*8):(i*8)+4])
+                        variables[(i*8)+4:(i*8)+8] = temp
+                        crossover(variables[(i*8)+4:(i*8)+8])
+                        parent = temp
+                        child = np.copy(variables[(i*8)+4:(i*8)+8])
+                        parent_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], parent)
+                        child_speed = bouncing_cube(mass_list_array[(i*2)+1], lsd, xyz_array[(2*i)+1], plane, spring_array[(i*2)+1], child)
+                        if parent_speed > child_speed:
+                            variables[(i*8)+4:(i*8)+8] = parent
+                        if parent_speed < child_speed:
+                            variables[(i*8)+4:(i*8)+8] = child 
+                if more_mut == 1:
+                    if speed1 < 0.33*best_speed:
+                        evolve(variables[(i*8):(i*8)+4])
+        speeds[j] = best_speed
+    complexity = np.zeros((len(xyz_array)))
+    for i in range(len(xyz_array)):
+        complexity[i] = len(xyz_array[i])    
+    return speeds, best_speed_vars, best_speed, dot_plot_data, complexity, final_speeds, best_speed_xyz, fastest_index, all_sizes
+def distance(p1, p2):
+    return abs(p1-p2)
+def dot_plot(dot_plot_data):
+    distance_array = np.zeros((len(dot_plot_data)))
+    for i in range(len(dot_plot_data)):  
+        distances = [distance(p1, p2) for p1, p2 in combinations(dot_plot_data[i], 2)]
+        avg_distance = sum(distances) / len(distances)
+        distance_array[i] = avg_distance
+    return distance_array
+def error_func(best_ys, num_of_evals, num_of_runs):
+    total_ys = np.zeros(len(best_ys[0]))
+    for i in range(len(best_ys)):
+        total_ys += best_ys[i]
+    error_bar_evals = num_of_evals/5
+    rand_fits = []
+    for j in range(num_of_runs):
+        best = []
+        for i in range(0, num_of_evals, int(num_of_evals/5)):
+            best.append(best_ys[j][i])
+        rand_fits.append(best)
+    best_bars = np.std(rand_fits, axis=0)/np.sqrt(num_of_runs)
+    yerr = np.zeros(num_of_evals)
+    for i in range(5):
+        yerr_position = int(((i+1)*error_bar_evals)-1)
+        yerr[yerr_position] = best_bars[i]
+    return yerr
+def main(num_of_runs, plane):
+    speed_array_rand = []
+    speed_array_hc = []
+    speed_array_gp = []
+    speed_array_nm = []
+    speed_array_dc = []
+    best_xyz_array = []
+    for i in range(num_of_runs):
+        speeds, best_speed_vars, best_speed = randomWalk(num_of_evals, plane)
+        speeds_hc, best_speed_vars_hc, best_speed_hc = hill_climb(num_of_evals, plane)
+        speeds_gp, best_speed_vars_gp, best_speed_gp, dot_plot_data, complexity, final_speeds, best_speed_xyz, fastest_index, all_sizes = GP(num_of_evals, plane, 0)
+        speeds_nm, best_speed_vars_nm, best_speed_nm, dot_plot_data_nm, complexity_nm, final_speeds_nm, best_speed_xyz_nm, fastest_index_nm, all_sizes_nm = GP_nomass(num_of_evals, plane, 0)
+        speeds_dc, best_speed_vars_dc, best_speed_dc, dot_plot_data_dc, complexity_dc, final_speeds_dc, best_speed_xyz_dc, fastest_index_dc, all_sizes_dc = GP_noDC(num_of_evals, plane, 0)
+        print('best hc vars: ', best_speed_vars_hc)
+        print('best GP speed: ', speeds_gp)
+        print('best gp vars: ', best_speed_vars_gp)
+        speed_array_rand.append(speeds)
+        speed_array_hc.append(speeds_hc)
+        speed_array_gp.append(speeds_gp)
+        speed_array_nm.append(speeds_nm)
+        speed_array_dc.append(speeds_dc)
+        best_xyz_array.append(best_speed_xyz)
+    rand_sum = np.zeros((len(speed_array_rand[0])))
+    hc_sum = np.zeros((len(speed_array_hc[0])))
+    gp_sum = np.zeros((len(speed_array_gp[0])))
+    nm_sum = np.zeros((len(speed_array_nm[0])))
+    dc_sum = np.zeros((len(speed_array_dc[0])))
+    for i in range(num_of_runs):
+        rand_sum = np.sum([speed_array_rand[i], rand_sum], axis = 0)
+        hc_sum = np.sum([speed_array_hc[i], hc_sum], axis = 0)
+        gp_sum = np.sum([speed_array_gp[i], gp_sum], axis = 0)
+        nm_sum = np.sum([speed_array_nm[i], nm_sum], axis = 0)
+        dc_sum = np.sum([speed_array_dc[i], dc_sum], axis = 0)
+    speeds = np.divide(rand_sum, num_of_runs)
+    speeds_hc = np.divide(hc_sum, num_of_runs)
+    speeds_gp = np.divide(gp_sum, num_of_runs)
+    speeds_nm = np.divide(nm_sum, num_of_runs)
+    speeds_dc = np.divide(dc_sum, num_of_runs)
+    return speeds, speeds_hc, speeds_gp, speeds_nm, speeds_dc, dot_plot_data, dot_plot_data_nm, dot_plot_data_dc, speed_array_rand, speed_array_hc, speed_array_gp, speed_array_nm, speed_array_dc, complexity, final_speeds, best_xyz_array, fastest_index, all_sizes
+num_of_runs = 1
+plane = createPlane()
+num_of_evals = 500
+evals = np.arange(0, num_of_evals)
+speeds, speeds_hc, speeds_gp, speeds_nm, speeds_dc, dot_plot_data, dot_plot_data_nm, dot_plot_data_dc, speed_array_rand, speed_array_hc, speed_array_gp, speed_array_nm, speed_array_dc, complexity, final_speeds, best_xyz_array, fastest_index, all_sizes = main(num_of_runs, plane)
+distance_array = dot_plot(dot_plot_data)
+distance_array_nm = dot_plot(dot_plot_data_nm)
+distance_array_dc = dot_plot(dot_plot_data_dc)
+error_rand = error_func(speed_array_rand, num_of_evals, num_of_runs)
+error_hc = error_func(speed_array_hc, num_of_evals, num_of_runs)
+error_gp = error_func(speed_array_gp, num_of_evals, num_of_runs)
+error_nm = error_func(speed_array_nm, num_of_evals, num_of_runs)
+error_dc = error_func(speed_array_dc, num_of_evals, num_of_runs)
+print('Best shapes: ', best_xyz_array)
+plt.figure(1)
+plt.title('Best Speed')
+plt.xlabel('Evaluations')
+plt.ylabel('Speed (m/s)')
+plt.errorbar(evals, speeds, error_rand, linestyle='-', label = 'Random Speed (m/s)')
+plt.errorbar(evals, speeds_hc, error_hc, linestyle='-', label = 'HC Speed (m/s)')
+plt.errorbar(evals, speeds_gp, error_gp, linestyle='-', label = 'GP Speed (m/s)')
+plt.errorbar(evals, speeds_nm, error_nm, linestyle='-', label = 'GP Single Objective Speed (m/s)')
+plt.errorbar(evals, speeds_dc, error_nm, linestyle='-', label = 'GP No Deterministic Crowding (m/s)')
+plt.legend()
+plt.show()
+XVals = []
+temp_array_div = dot_plot_data
+YVals = []
+X = [evals[i] for i, data in enumerate(dot_plot_data) for j in range(len(data))]
+Y = [val for data in dot_plot_data for val in data]
+plt.figure(2)
+plt.scatter(X, Y, s=1, label = 'GP')
+plt.ylim(bottom = 0)
+plt.title('Speed Dot Plot')
+plt.xlabel('Number of Evaluations')
+plt.ylabel('Speed (m/s)')
+plt.legend()
+plt.show
+plt.figure(3)
+plt.title('Diversity')
+plt.xlabel('Evaluations')
+plt.ylabel('Average Distance Between Speeds')
+plt.plot(evals, distance_array, linestyle='-', label = 'Average Dist GP')
+plt.plot(evals, distance_array_nm, linestyle='-', label = 'Average Dist GP Single Objective')
+plt.plot(evals, distance_array_dc, linestyle='-', label = 'Average Dist GP No Deterministic Crowding')
+plt.legend()
+plt.show
+plt.figure(4)
+plt.title('Pareto')
+plt.xlabel('Speeds (m/s)')
+plt.ylabel('Complexity (# of Masses)')
+plt.scatter(final_speeds, complexity, s=1)
+plt.show
+plt.figure(5)
+plt.title('Pareto')
+plt.xlabel('Speeds (m/s)')
+plt.ylabel('Complexity (# of Masses)')
+plt.scatter(dot_plot_data[fastest_index[0]], all_sizes[fastest_index[0]], s=1)
+plt.show
